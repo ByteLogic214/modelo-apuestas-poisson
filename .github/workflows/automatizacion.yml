@@ -1,40 +1,40 @@
-name: Ejecucion Diaria del Modelo Estadistico
+name: Daily Poisson Prediction
 
 on:
   schedule:
-    - cron: '0 6 * * *'
-  workflow_dispatch:
+    # Se ejecuta todos los días a las 08:00 UTC (ajusta según tu huso horario)
+    - cron: '0 8 * * *'
+  workflow_dispatch:   # Permite ejecutar manualmente desde la interfaz de GitHub
 
 jobs:
-  calcular-predicciones:
+  model_and_push:
     runs-on: ubuntu-latest
-    
-    # 1. Otorgar permisos para que el servidor pueda guardar el archivo Excel en tu repositorio
+    # Permisos necesarios para escribir en el repositorio
     permissions:
       contents: write
 
     steps:
-    - name: Clonar el repositorio actual
-      uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Configurar Entorno de Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.10'
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
 
-    - name: Instalar Libreria de Peticiones Web
-      run: pip install requests
+      - name: Install dependencies
+        run: pip install requests
 
-    - name: Ejecutar Motor Estadistico de Poisson
-      env:
-        API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
-      run: python mi_modelo.py
+      - name: Run Poisson model
+        env:
+          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
+        run: python mi_modelo.py
 
-    # 2. Comando automático para tomar el archivo .csv generado y subirlo a tu cuenta de GitHub
-    - name: Guardar y Subir Cambios al Repositorio
-      run: |
-        git config --global user.name "Bot_Poisson_Apuestas"
-        git config --global user.email "actions@github.com"
-        git add predicciones_historico.csv
-        git commit -m "Actualización automática de predicciones diarias [skip ci]" || echo "No hay partidos nuevos hoy"
-        git push
+      - name: Commit and push results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add predicciones_historico.csv
+          # [skip ci] evita que este commit vuelva a lanzar el workflow
+          git commit -m "Actualización diaria de predicciones [skip ci]" || echo "No hay cambios para commitear"
+          git push
