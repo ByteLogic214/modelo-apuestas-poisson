@@ -1,17 +1,16 @@
-name: Daily Poisson Prediction
+name: Daily Tipster Model
 
 on:
   schedule:
-    # Se ejecuta todos los días a las 08:00 UTC (ajusta según tu huso horario)
-    - cron: '0 8 * * *'
-  workflow_dispatch:   # Permite ejecutar manualmente desde la interfaz de GitHub
+    # Ejecución diaria a las 06:00 UTC
+    - cron: '0 6 * * *'
+  workflow_dispatch:   # Permite ejecución manual
 
 jobs:
-  model_and_push:
+  run_model_and_push:
     runs-on: ubuntu-latest
-    # Permisos necesarios para escribir en el repositorio
     permissions:
-      contents: write
+      contents: write   # Necesario para hacer push del CSV
 
     steps:
       - name: Checkout repository
@@ -25,7 +24,7 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      - name: Run Poisson model
+      - name: Run Poisson model (multi-league + value betting)
         env:
           API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
         run: python mi_modelo.py
@@ -35,6 +34,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add predicciones_historico.csv
-          # [skip ci] evita que este commit vuelva a lanzar el workflow
+          # Usamos [skip ci] para evitar bucles infinitos
           git commit -m "Actualización diaria de predicciones [skip ci]" || echo "No hay cambios para commitear"
           git push
