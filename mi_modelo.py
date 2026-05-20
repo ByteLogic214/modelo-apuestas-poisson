@@ -10,35 +10,53 @@ from datetime import datetime
 # CONFIGURACIÓN GLOBAL
 # ============================================================
 API_KEY = os.getenv("API_FOOTBALL_KEY")
+if not API_KEY:
+    raise ValueError("❌ ERROR: La variable de entorno 'API_FOOTBALL_KEY' no está definida. "
+                     "Asegúrate de configurar el secreto en GitHub → Settings → Secrets → Actions.")
+
 HEADERS = {"X-Auth-Token": API_KEY}
 MAX_RETRIES = 3
 RETRY_DELAY = 5           # segundos entre reintentos
-LIGUE_DELAY = 3           # delay entre peticiones de distintas ligas (para evitar rate limits)
-MARGEN_CASA = 0.05        # margen simulado de la casa de apuestas (5%)
-KELLY_FRACCION = 0.25     # fracción de Kelly a usar (25%)
-UMBRAL_EV = 0.05          # valor esperado mínimo (5%) para considerar apuesta
+LIGUE_DELAY = 3           # delay entre peticiones de distintas ligas
+MARGEN_CASA = 0.05        # margen simulado de la casa (5%)
+KELLY_FRACCION = 0.25     # fracción de Kelly (25%)
+UMBRAL_EV = 0.05          # valor esperado mínimo (5%)
 
-# Ligas a procesar (códigos de football-data.org)
+# Ligas a procesar
 LIGAS = ["PL", "PD", "SA", "BL1", "CL"]   # Premier, LaLiga, Serie A, Bundesliga, Champions
 
 # ============================================================
-# FUNCIONES AUXILIARES DE RED (con reintentos)
+# FUNCIONES AUXILIARES DE RED (con reintentos y manejo de 400)
 # ============================================================
 def fetch_data(url, max_retries=MAX_RETRIES, delay=RETRY_DELAY):
-    """Realiza una petición GET con reintentos y retardo por rate limiting."""
+    """
+    Realiza una petición GET con reintentos.
+    - Error 400 = clave inválida o petición mal formada → NO reintenta, mensaje claro.
+    - Error 429/5xx → reintenta con espera.
+    """
     for intento in range(1, max_retries + 1):
         try:
             respuesta = requests.get(url, headers=HEADERS, timeout=15)
             if respuesta.status_code == 200:
                 return respuesta.json()
+            elif respuesta.status_code == 400:
+                print("🚨 Error 400: La solicitud es inválida. Probablemente la clave API no es correcta "
+                      "o no está configurada en el entorno. Verifica el secreto en GitHub.")
+                return None
+            elif respuesta.status_code == 401:
+                print("🚨 Error 401: No autorizado. Revisa la clave API.")
+                return None
+            elif respuesta.status_code == 403:
+                print("🚨 Error 403: Acceso denegado. Posiblemente el plan gratuito no permite esta liga.")
+                return None
             elif respuesta.status_code in (429, 500, 502, 503, 504):
-                print(f"Intento {intento}/{max_retries} - Código {respuesta.status_code}. Esperando {delay}s...")
+                print(f"⚠️ Intento {intento}/{max_retries} - Código {respuesta.status_code}. Esperando {delay}s...")
                 time.sleep(delay)
             else:
-                print(f"Error fatal en API: Código {respuesta.status_code}")
+                print(f"❌ Error fatal en API: Código {respuesta.status_code}")
                 return None
         except RequestException as e:
-            print(f"Error de red en intento {intento}/{max_retries}: {e}")
+            print(f"🔴 Error de red en intento {intento}/{max_retries}: {e}")
             if intento < max_retries:
                 time.sleep(delay)
             else:
@@ -47,21 +65,19 @@ def fetch_data(url, max_retries=MAX_RETRIES, delay=RETRY_DELAY):
     return None
 
 def obtener_datos_liga(id_liga):
-    """Obtiene partidos finalizados de la liga (histórico)."""
     url = f"https://api.football-data.org/v4/competitions/{id_liga}/matches?status=FINISHED"
     try:
         data = fetch_data(url)
         if data and "matches" in data:
             return data["matches"]
         else:
-            print(f"No se encontraron partidos para la liga {id_liga}")
+            print(f"📭 No se encontraron partidos para la liga {id_liga}")
             return []
     except Exception as e:
         print(f"Error inesperado en obtener_datos_liga: {e}")
         return []
 
 def obtener_partidos_hoy(id_liga):
-    """Obtiene partidos programados para hoy en la liga."""
     url = f"https://api.football-data.org/v4/competitions/{id_liga}/matches?status=SCHEDULED"
     try:
         data = fetch_data(url)
@@ -77,16 +93,11 @@ def obtener_partidos_hoy(id_liga):
 # MODELO DE POISSON
 # ============================================================
 def calcular_poisson(k, lam):
-    """Función de probabilidad de Poisson."""
     if lam <= 0:
         return 0.0
     return (math.pow(lam, k) * math.exp(-lam)) / math.factorial(k)
 
 def calcular_probabilidades_marcador(lambda_local, lambda_vis, max_goles=5):
-    """
-    Calcula matriz de probabilidades de marcadores (0..max_goles)
-    Devuelve: prob_local, prob_empate, prob_visitante, prob_over_2_5
-    """
     prob_local = 0.0
     prob_empate = 0.0
     prob_visitante = 0.0
@@ -118,50 +129,37 @@ def calcular_probabilidades_marcador(lambda_local, lambda_vis, max_goles=5):
     return prob_local, prob_empate, prob_visitante, prob_over_2_5
 
 # ============================================================
-# FILTRO DE VALOR (VALUE BETTING)
+# VALUE BETTING & KELLY
 # ============================================================
 def simular_cuota_mercado(prob_modelo):
-    """
-    Simula la cuota de mercado a partir de la probabilidad del modelo,
-    asumiendo un margen de la casa del MARGEN_CASA%.
-    La cuota justa es 1/prob_modelo.
-    La cuota de mercado se calcula como 1/(prob_modelo * (1 + MARGEN_CASA)).
-    """
     if prob_modelo <= 0:
         return 999
     prob_con_margen = prob_modelo * (1 + MARGEN_CASA)
     return 1.0 / prob_con_margen if prob_con_margen > 0 else 999
 
 def calcular_valor_esperado(cuota_mercado, prob_modelo):
-    """Devuelve el valor esperado: (cuota_mercado * prob_modelo) - 1"""
     return (cuota_mercado * prob_modelo) - 1.0
 
 def calcular_stake_kelly(cuota_mercado, prob_modelo, fraccion=KELLY_FRACCION):
-    """
-    Calcula el stake óptimo según el criterio de Kelly fraccional.
-    Fórmula completa: f = (cuota * prob - 1) / (cuota - 1)
-    Luego se multiplica por la fracción y se limita a entre 0 y 0.25 (para evitar apuestas muy grandes).
-    """
     if cuota_mercado <= 1:
         return 0.0
     f = (cuota_mercado * prob_modelo - 1) / (cuota_mercado - 1)
     if f <= 0:
         return 0.0
-    stake = min(f * fraccion, 0.25)  # cap al 25% del bankroll como máximo
+    stake = min(f * fraccion, 0.25)
     return round(stake, 4)
 
 # ============================================================
-# PROCESO PRINCIPAL (por liga)
+# PROCESO POR LIGA
 # ============================================================
 def procesar_liga(id_liga):
-    """Procesa una liga y devuelve una lista de diccionarios con las predicciones."""
     print(f"\n{'='*60}")
     print(f"Procesando liga: {id_liga}")
     print(f"{'='*60}")
 
     partidos_jugados = obtener_datos_liga(id_liga)
     if not partidos_jugados:
-        print(f"No hay datos históricos para {id_liga}. Saltando.")
+        print(f"Saltando {id_liga} (sin datos históricos).")
         return []
 
     partidos_hoy = obtener_partidos_hoy(id_liga)
@@ -224,7 +222,7 @@ def procesar_liga(id_liga):
             continue
 
         if eq_local not in equipos or eq_visitante not in equipos:
-            print(f"Sin datos suficientes para {eq_local} vs {eq_visitante} en {id_liga}. Omitiendo.")
+            print(f"Sin datos para {eq_local} vs {eq_visitante} en {id_liga}. Omitiendo.")
             continue
 
         try:
@@ -241,13 +239,12 @@ def procesar_liga(id_liga):
         prob_local, prob_empate, prob_visitante, prob_over_2_5 = \
             calcular_probabilidades_marcador(lambda_local, lambda_visitante)
 
-        # ----- VALOR PARA MERCADO 1X2 -----
-        # Para cada resultado (local, empate, visitante) evaluamos si hay valor
+        # Evaluar cada mercado
         resultados = [
             ("1", eq_local, prob_local),
             ("X", "Empate", prob_empate),
             ("2", eq_visitante, prob_visitante),
-            ("Over 2.5", f"{eq_local} vs {eq_visitante}", prob_over_2_5)  # mercado aparte
+            ("Over 2.5", f"{eq_local} vs {eq_visitante}", prob_over_2_5)
         ]
 
         for mercado, descripcion, prob_modelo in resultados:
@@ -260,7 +257,6 @@ def procesar_liga(id_liga):
 
             if ev > UMBRAL_EV:
                 stake = calcular_stake_kelly(cuota_mercado, prob_modelo)
-                # Solo guardar apuestas con valor positivo
                 prediccion = {
                     "Fecha_Calculo": datetime.now().strftime("%Y-%m-%d"),
                     "Liga": id_liga,
@@ -268,13 +264,13 @@ def procesar_liga(id_liga):
                     "Mercado": mercado,
                     "Pronostico_Sugerido": descripcion if mercado in ["1","X","2"] else "Over 2.5",
                     "Cuota_Recomendada": round(cuota_mercado, 2),
-                    "Stake_Asignado_Pct": round(stake * 100, 2),  # en porcentaje
+                    "Stake_Asignado_Pct": round(stake * 100, 2),
                     "Probabilidad_Modelo_Pct": round(prob_modelo * 100, 1),
-                    "Valor_Esperado": round(ev * 100, 2),  # en porcentaje
-                    "Resultado_Final": ""   # se rellenará manualmente después
+                    "Valor_Esperado": round(ev * 100, 2),
+                    "Resultado_Final": ""
                 }
                 predicciones.append(prediccion)
-                print(f"✅ Apuesta registrada: {mercado} - {descripcion} | Cuota {cuota_mercado} | Stake {stake*100:.2f}% | EV {ev*100:.2f}%")
+                print(f"✅ Apuesta: {mercado} {descripcion} | Cuota {cuota_mercado} | Stake {stake*100:.2f}% | EV {ev*100:.2f}%")
             else:
                 print(f"ℹ️ Sin valor en {mercado} para {eq_local} vs {eq_visitante} (EV: {ev*100:.2f}%)")
 
@@ -286,12 +282,11 @@ def main():
     for liga in LIGAS:
         preds = procesar_liga(liga)
         todas_predicciones.extend(preds)
-        # Esperar entre ligas para no exceder rate limits
         if liga != LIGAS[-1]:
             print(f"Esperando {LIGUE_DELAY} segundos antes de la siguiente liga...")
             time.sleep(LIGUE_DELAY)
 
-    # Guardar en CSV
+    # Guardar CSV
     nombre_archivo = "predicciones_historico.csv"
     existe_archivo = os.path.exists(nombre_archivo)
 
@@ -305,7 +300,6 @@ def main():
         escritor = csv.DictWriter(archivo_csv, fieldnames=campos, delimiter=";")
         if not existe_archivo:
             escritor.writeheader()
-
         for pred in todas_predicciones:
             escritor.writerow(pred)
 
