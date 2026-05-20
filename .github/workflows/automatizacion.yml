@@ -4,13 +4,13 @@ on:
   schedule:
     # Ejecución diaria a las 06:00 UTC
     - cron: '0 6 * * *'
-  workflow_dispatch:   # Permite ejecución manual
+  workflow_dispatch:
 
 jobs:
   run_model_and_push:
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # Necesario para hacer push del CSV
+      contents: write
 
     steps:
       - name: Checkout repository
@@ -24,7 +24,7 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      - name: Run Poisson model (multi-league + value betting)
+      - name: Run Poisson model
         env:
           API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
         run: python mi_modelo.py
@@ -34,6 +34,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add predicciones_historico.csv
-          # Usamos [skip ci] para evitar bucles infinitos
-          git commit -m "Actualización diaria de predicciones [skip ci]" || echo "No hay cambios para commitear"
+          git commit -m "Actualización diaria de predicciones [skip ci]" || echo "No hay cambios"
           git push
