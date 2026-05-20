@@ -7,31 +7,34 @@ import time
 from datetime import datetime
 
 # ============================================================
-# CONFIGURACIÓN
+# CONFIGURACIÓN GLOBAL
 # ============================================================
 API_KEY = os.getenv("API_FOOTBALL_KEY")
 HEADERS = {"X-Auth-Token": API_KEY}
-LIGA = "PL"  # Premier League
 MAX_RETRIES = 3
-RETRY_DELAY = 5  # segundos entre reintentos
+RETRY_DELAY = 5           # segundos entre reintentos
+LIGUE_DELAY = 3           # delay entre peticiones de distintas ligas (para evitar rate limits)
+MARGEN_CASA = 0.05        # margen simulado de la casa de apuestas (5%)
+KELLY_FRACCION = 0.25     # fracción de Kelly a usar (25%)
+UMBRAL_EV = 0.05          # valor esperado mínimo (5%) para considerar apuesta
+
+# Ligas a procesar (códigos de football-data.org)
+LIGAS = ["PL", "PD", "SA", "BL1", "CL"]   # Premier, LaLiga, Serie A, Bundesliga, Champions
 
 # ============================================================
-# FUNCIONES AUXILIARES CON REINTENTOS Y MANEJO DE ERRORES
+# FUNCIONES AUXILIARES DE RED (con reintentos)
 # ============================================================
 def fetch_data(url, max_retries=MAX_RETRIES, delay=RETRY_DELAY):
     """Realiza una petición GET con reintentos y retardo por rate limiting."""
     for intento in range(1, max_retries + 1):
         try:
             respuesta = requests.get(url, headers=HEADERS, timeout=15)
-            # Si el código es 200, devolvemos el JSON
             if respuesta.status_code == 200:
                 return respuesta.json()
-            # Si hay rate limiting (429) o error de servidor (5xx), reintentamos
             elif respuesta.status_code in (429, 500, 502, 503, 504):
                 print(f"Intento {intento}/{max_retries} - Código {respuesta.status_code}. Esperando {delay}s...")
                 time.sleep(delay)
             else:
-                # Error no recuperable (401, 403, 404, etc.)
                 print(f"Error fatal en API: Código {respuesta.status_code}")
                 return None
         except RequestException as e:
@@ -71,7 +74,7 @@ def obtener_partidos_hoy(id_liga):
         return []
 
 # ============================================================
-# MODELO DE POISSON MEJORADO
+# MODELO DE POISSON
 # ============================================================
 def calcular_poisson(k, lam):
     """Función de probabilidad de Poisson."""
@@ -81,8 +84,8 @@ def calcular_poisson(k, lam):
 
 def calcular_probabilidades_marcador(lambda_local, lambda_vis, max_goles=5):
     """
-    Calcula matriz de probabilidades de marcadores (hasta max_goles goles por equipo)
-    y devuelve: prob_local, prob_empate, prob_visitante, prob_over_2_5.
+    Calcula matriz de probabilidades de marcadores (0..max_goles)
+    Devuelve: prob_local, prob_empate, prob_visitante, prob_over_2_5
     """
     prob_local = 0.0
     prob_empate = 0.0
@@ -102,11 +105,9 @@ def calcular_probabilidades_marcador(lambda_local, lambda_vis, max_goles=5):
             else:
                 prob_visitante += p_marcador
 
-            # Goles totales > 2.5 (al menos 3 goles)
             if x + y >= 3:
                 prob_over_2_5 += p_marcador
 
-    # Normalizar para que la suma sea exactamente 1 (redondeo numérico)
     suma = prob_local + prob_empate + prob_visitante
     if suma > 0:
         factor = 1.0 / suma
@@ -116,60 +117,76 @@ def calcular_probabilidades_marcador(lambda_local, lambda_vis, max_goles=5):
 
     return prob_local, prob_empate, prob_visitante, prob_over_2_5
 
-def calcular_margen_valor(prob_local, prob_empate, prob_visitante):
+# ============================================================
+# FILTRO DE VALOR (VALUE BETTING)
+# ============================================================
+def simular_cuota_mercado(prob_modelo):
     """
-    Calcula un indicador de valor: diferencia porcentual entre la probabilidad más alta
-    y la probabilidad justa (1/3). Si el margen supera el 20%, etiqueta como 'Alto'.
+    Simula la cuota de mercado a partir de la probabilidad del modelo,
+    asumiendo un margen de la casa del MARGEN_CASA%.
+    La cuota justa es 1/prob_modelo.
+    La cuota de mercado se calcula como 1/(prob_modelo * (1 + MARGEN_CASA)).
     """
-    max_prob = max(prob_local, prob_empate, prob_visitante)
-    baseline = 1.0 / 3.0
-    if max_prob == 0:
-        return "N/A"
-    margen = ((max_prob - baseline) / baseline) * 100
-    if margen > 20:
-        return "Alto"
-    else:
-        return "Normal"
+    if prob_modelo <= 0:
+        return 999
+    prob_con_margen = prob_modelo * (1 + MARGEN_CASA)
+    return 1.0 / prob_con_margen if prob_con_margen > 0 else 999
+
+def calcular_valor_esperado(cuota_mercado, prob_modelo):
+    """Devuelve el valor esperado: (cuota_mercado * prob_modelo) - 1"""
+    return (cuota_mercado * prob_modelo) - 1.0
+
+def calcular_stake_kelly(cuota_mercado, prob_modelo, fraccion=KELLY_FRACCION):
+    """
+    Calcula el stake óptimo según el criterio de Kelly fraccional.
+    Fórmula completa: f = (cuota * prob - 1) / (cuota - 1)
+    Luego se multiplica por la fracción y se limita a entre 0 y 0.25 (para evitar apuestas muy grandes).
+    """
+    if cuota_mercado <= 1:
+        return 0.0
+    f = (cuota_mercado * prob_modelo - 1) / (cuota_mercado - 1)
+    if f <= 0:
+        return 0.0
+    stake = min(f * fraccion, 0.25)  # cap al 25% del bankroll como máximo
+    return round(stake, 4)
 
 # ============================================================
-# PROCESO PRINCIPAL
+# PROCESO PRINCIPAL (por liga)
 # ============================================================
-def procesar_modelo():
-    id_liga = LIGA
-    print("Obteniendo datos históricos de la liga...")
+def procesar_liga(id_liga):
+    """Procesa una liga y devuelve una lista de diccionarios con las predicciones."""
+    print(f"\n{'='*60}")
+    print(f"Procesando liga: {id_liga}")
+    print(f"{'='*60}")
+
     partidos_jugados = obtener_datos_liga(id_liga)
     if not partidos_jugados:
-        print("No se pudieron obtener partidos históricos. Saliendo.")
-        return
+        print(f"No hay datos históricos para {id_liga}. Saltando.")
+        return []
 
-    print("Obteniendo partidos programados para hoy...")
     partidos_hoy = obtener_partidos_hoy(id_liga)
     if not partidos_hoy:
-        print("No hay partidos programados para hoy. Saliendo.")
-        return
+        print(f"No hay partidos programados hoy para {id_liga}. Saltando.")
+        return []
 
-    # Variables para promedios de la liga
+    # Estadísticas de la liga
     total_goles_local = 0
     total_goles_visitante = 0
     total_partidos = 0
     equipos = {}
 
-    # Procesar partidos jugados para estadísticas
     for partido in partidos_jugados:
         try:
             local = partido["homeTeam"]["name"]
             visitante = partido["awayTeam"]["name"]
             goles_l = partido["score"]["fullTime"]["home"]
             goles_v = partido["score"]["fullTime"]["away"]
-
             if goles_l is None or goles_v is None:
                 continue
-
             total_goles_local += goles_l
             total_goles_visitante += goles_v
             total_partidos += 1
 
-            # Inicializar equipos si no existen
             for eq in [local, visitante]:
                 if eq not in equipos:
                     equipos[eq] = {
@@ -187,90 +204,112 @@ def procesar_modelo():
             equipos[visitante]["goles_anotados_fuera"] += goles_v
             equipos[visitante]["goles_recibidos_fuera"] += goles_l
             equipos[visitante]["partidos_fuera"] += 1
-        except KeyError as e:
-            print(f"Advertencia: Error al procesar partido histórico: {e}")
+        except KeyError:
             continue
 
     if total_partidos == 0:
-        print("No se pudieron calcular estadísticas (sin partidos válidos).")
-        return
+        print(f"No hay partidos históricos válidos para {id_liga}.")
+        return []
 
     pgl = total_goles_local / total_partidos
     pgv = total_goles_visitante / total_partidos
 
-    # Archivo CSV
+    predicciones = []
+
+    for partido in partidos_hoy:
+        try:
+            eq_local = partido["homeTeam"]["name"]
+            eq_visitante = partido["awayTeam"]["name"]
+        except KeyError:
+            continue
+
+        if eq_local not in equipos or eq_visitante not in equipos:
+            print(f"Sin datos suficientes para {eq_local} vs {eq_visitante} en {id_liga}. Omitiendo.")
+            continue
+
+        try:
+            fac = (equipos[eq_local]["goles_anotados_casa"] / equipos[eq_local]["partidos_casa"]) / pgl if pgl > 0 else 0
+            fdv = (equipos[eq_visitante]["goles_recibidos_fuera"] / equipos[eq_visitante]["partidos_fuera"]) / pgl if pgl > 0 else 0
+            fav = (equipos[eq_visitante]["goles_anotados_fuera"] / equipos[eq_visitante]["partidos_fuera"]) / pgv if pgv > 0 else 0
+            fdl = (equipos[eq_local]["goles_recibidos_casa"] / equipos[eq_local]["partidos_casa"]) / pgv if pgv > 0 else 0
+        except ZeroDivisionError:
+            continue
+
+        lambda_local = fac * fdv * pgl
+        lambda_visitante = fav * fdl * pgv
+
+        prob_local, prob_empate, prob_visitante, prob_over_2_5 = \
+            calcular_probabilidades_marcador(lambda_local, lambda_visitante)
+
+        # ----- VALOR PARA MERCADO 1X2 -----
+        # Para cada resultado (local, empate, visitante) evaluamos si hay valor
+        resultados = [
+            ("1", eq_local, prob_local),
+            ("X", "Empate", prob_empate),
+            ("2", eq_visitante, prob_visitante),
+            ("Over 2.5", f"{eq_local} vs {eq_visitante}", prob_over_2_5)  # mercado aparte
+        ]
+
+        for mercado, descripcion, prob_modelo in resultados:
+            if prob_modelo <= 0:
+                continue
+
+            cuota_justa = 1 / prob_modelo if prob_modelo > 0 else 999
+            cuota_mercado = simular_cuota_mercado(prob_modelo)
+            ev = calcular_valor_esperado(cuota_mercado, prob_modelo)
+
+            if ev > UMBRAL_EV:
+                stake = calcular_stake_kelly(cuota_mercado, prob_modelo)
+                # Solo guardar apuestas con valor positivo
+                prediccion = {
+                    "Fecha_Calculo": datetime.now().strftime("%Y-%m-%d"),
+                    "Liga": id_liga,
+                    "Partido": f"{eq_local} vs {eq_visitante}",
+                    "Mercado": mercado,
+                    "Pronostico_Sugerido": descripcion if mercado in ["1","X","2"] else "Over 2.5",
+                    "Cuota_Recomendada": round(cuota_mercado, 2),
+                    "Stake_Asignado_Pct": round(stake * 100, 2),  # en porcentaje
+                    "Probabilidad_Modelo_Pct": round(prob_modelo * 100, 1),
+                    "Valor_Esperado": round(ev * 100, 2),  # en porcentaje
+                    "Resultado_Final": ""   # se rellenará manualmente después
+                }
+                predicciones.append(prediccion)
+                print(f"✅ Apuesta registrada: {mercado} - {descripcion} | Cuota {cuota_mercado} | Stake {stake*100:.2f}% | EV {ev*100:.2f}%")
+            else:
+                print(f"ℹ️ Sin valor en {mercado} para {eq_local} vs {eq_visitante} (EV: {ev*100:.2f}%)")
+
+    return predicciones
+
+def main():
+    todas_predicciones = []
+
+    for liga in LIGAS:
+        preds = procesar_liga(liga)
+        todas_predicciones.extend(preds)
+        # Esperar entre ligas para no exceder rate limits
+        if liga != LIGAS[-1]:
+            print(f"Esperando {LIGUE_DELAY} segundos antes de la siguiente liga...")
+            time.sleep(LIGUE_DELAY)
+
+    # Guardar en CSV
     nombre_archivo = "predicciones_historico.csv"
     existe_archivo = os.path.exists(nombre_archivo)
 
-    # Cabeceras con las nuevas columnas
     campos = [
-        "Fecha_Calculo", "Liga", "Local", "Visitante",
-        "Goles_Exp_Local", "Goles_Exp_Vis",
-        "Prob_1", "Prob_X", "Prob_2",
-        "Cuota_1", "Cuota_X", "Cuota_2",
-        "Over_2_5_Prob", "Margen_Valor"
+        "Fecha_Calculo", "Liga", "Partido", "Mercado",
+        "Pronostico_Sugerido", "Cuota_Recomendada", "Stake_Asignado_Pct",
+        "Probabilidad_Modelo_Pct", "Valor_Esperado", "Resultado_Final"
     ]
 
     with open(nombre_archivo, mode="a", newline="", encoding="utf-8-sig") as archivo_csv:
         escritor = csv.DictWriter(archivo_csv, fieldnames=campos, delimiter=";")
-
         if not existe_archivo:
             escritor.writeheader()
 
-        fecha_actual = datetime.now().strftime("%Y-%m-%d")
+        for pred in todas_predicciones:
+            escritor.writerow(pred)
 
-        for partido in partidos_hoy:
-            try:
-                eq_local = partido["homeTeam"]["name"]
-                eq_visitante = partido["awayTeam"]["name"]
-            except KeyError:
-                print("Advertencia: partido sin nombres de equipo, saltando.")
-                continue
-
-            if eq_local not in equipos or eq_visitante not in equipos:
-                print(f"Equipo(s) sin datos históricos: {eq_local} vs {eq_visitante}, omitiendo.")
-                continue
-
-            # Calcular factores de ataque/defensa
-            try:
-                fac = (equipos[eq_local]["goles_anotados_casa"] / equipos[eq_local]["partidos_casa"]) / pgl if pgl > 0 else 0
-                fdv = (equipos[eq_visitante]["goles_recibidos_fuera"] / equipos[eq_visitante]["partidos_fuera"]) / pgl if pgl > 0 else 0
-                fav = (equipos[eq_visitante]["goles_anotados_fuera"] / equipos[eq_visitante]["partidos_fuera"]) / pgv if pgv > 0 else 0
-                fdl = (equipos[eq_local]["goles_recibidos_casa"] / equipos[eq_local]["partidos_casa"]) / pgv if pgv > 0 else 0
-            except ZeroDivisionError:
-                print(f"Advertencia: División por cero para {eq_local} vs {eq_visitante}, omitiendo.")
-                continue
-
-            lambda_local = fac * fdv * pgl
-            lambda_visitante = fav * fdl * pgv
-
-            # Calcular probabilidades y Over 2.5
-            prob_local, prob_empate, prob_visitante, prob_over_2_5 = \
-                calcular_probabilidades_marcador(lambda_local, lambda_visitante)
-
-            cuota_local = 1 / prob_local if prob_local > 0 else 999
-            cuota_empate = 1 / prob_empate if prob_empate > 0 else 999
-            cuota_visitante = 1 / prob_visitante if prob_visitante > 0 else 999
-
-            margen_valor = calcular_margen_valor(prob_local, prob_empate, prob_visitante)
-
-            escritor.writerow({
-                "Fecha_Calculo": fecha_actual,
-                "Liga": id_liga,
-                "Local": eq_local,
-                "Visitante": eq_visitante,
-                "Goles_Exp_Local": round(lambda_local, 2),
-                "Goles_Exp_Vis": round(lambda_visitante, 2),
-                "Prob_1": f"{round(prob_local * 100, 1)}%",
-                "Prob_X": f"{round(prob_empate * 100, 1)}%",
-                "Prob_2": f"{round(prob_visitante * 100, 1)}%",
-                "Cuota_1": round(cuota_local, 2),
-                "Cuota_X": round(cuota_empate, 2),
-                "Cuota_2": round(cuota_visitante, 2),
-                "Over_2_5_Prob": f"{round(prob_over_2_5 * 100, 1)}%",
-                "Margen_Valor": margen_valor
-            })
-            print(f"✅ Predicción guardada: {eq_local} vs {eq_visitante}")
+    print(f"\n✅ Proceso completado. {len(todas_predicciones)} apuestas registradas en '{nombre_archivo}'.")
 
 if __name__ == "__main__":
-    procesar_modelo()
+    main()
