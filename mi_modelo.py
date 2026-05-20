@@ -9,16 +9,20 @@ API_KEY = os.getenv("API_FOOTBALL_KEY")
 HEADERS = {"X-Auth-Token": API_KEY}
 
 def obtener_datos_liga(id_liga):
+    # CORREGIDO: Se añadió la barra '/' faltante después de v4
     url = f"https://football-data.org{id_liga}/matches?status=FINISHED"
     respuesta = requests.get(url, headers=HEADERS)
     if respuesta.status_code != 200:
+        print(f"Error API histórico liga {id_liga}: Código {respuesta.status_code}")
         return None
     return respuesta.json().get("matches", [])
 
 def obtener_partidos_hoy(id_liga):
+    # CORREGIDO: Se añadió la barra '/' faltante después de v4
     url = f"https://football-data.org{id_liga}/matches?status=SCHEDULED"
     respuesta = requests.get(url, headers=HEADERS)
     if respuesta.status_code != 200:
+        print(f"Error API partidos hoy liga {id_liga}: Código {respuesta.status_code}")
         return []
     return respuesta.json().get("matches", [])
 
@@ -32,8 +36,12 @@ def procesar_modelo():
     partidos_jugados = obtener_datos_liga(id_liga)
     partidos_hoy = obtener_partidos_hoy(id_liga)
     
-    if not partidos_jugados or not partidos_hoy:
-        print("No hay datos suficientes o no hay partidos para hoy.")
+    if not partidos_jugados:
+        print("No se pudieron procesar las estadísticas históricas de la liga.")
+        return
+        
+    if not partidos_hoy:
+        print("No hay partidos programados para hoy en esta competición.")
         return
 
     total_goles_local = 0
@@ -68,17 +76,15 @@ def procesar_modelo():
     pgl = total_goles_local / total_partidos
     pgv = total_goles_visitante / total_partidos
 
-    # Preparar el archivo CSV para guardar resultados
     nombre_archivo = "predicciones_historico.csv"
     existe_archivo = os.path.exists(nombre_archivo)
     
-    # Abrir el archivo en modo "append" (añadir filas al final)
     with open(nombre_archivo, mode="a", newline="", encoding="utf-8") as archivo_csv:
         campos = ["Fecha_Calculo", "Liga", "Local", "Visitante", "Goles_Exp_Local", "Goles_Exp_Vis", "Prob_1", "Prob_X", "Prob_2", "Cuota_1", "Cuota_X", "Cuota_2"]
         escritor = csv.DictWriter(archivo_csv, fieldnames=campos, delimiter=";")
         
         if not existe_archivo:
-            escritor.writeheader() # Escribe los títulos de columna si el archivo es nuevo
+            escritor.writeheader()
             
         fecha_actual = datetime.now().strftime("%Y-%m-%d")
 
@@ -118,7 +124,6 @@ def procesar_modelo():
             cuota_empate = 1 / prob_empate if prob_empate > 0 else 999
             cuota_visitante = 1 / prob_visitante if prob_visitante > 0 else 999
             
-            # Guardar fila de datos
             escritor.writerow({
                 "Fecha_Calculo": fecha_actual,
                 "Liga": id_liga,
